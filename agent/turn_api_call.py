@@ -44,6 +44,9 @@ def _should_stream(agent: Any) -> bool:
     """Streaming is preferred even without consumers (stale-stream / read-timeout health
     checks); disabled on provider signal, ACP schemes, MoA without a display consumer, or
     Mock clients in tests (SimpleNamespace, not stream iterators)."""
+    from agent.inference_gate import require_unfenced
+    if require_unfenced(agent) is not None:
+        return True
     if getattr(agent, "_disable_streaming", False):
         return False
     _base = str(agent.base_url or "").lower()
@@ -80,6 +83,8 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        from agent.inference_gate import require_unfenced
+        require_unfenced(agent)
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),

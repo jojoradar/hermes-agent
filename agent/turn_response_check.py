@@ -161,6 +161,11 @@ def check_api_response(
         return _verdict("break")
 
     if finish_reason == "length":
+        from agent.inference_gate import get_gate
+        gate = get_gate(agent)
+        if gate is not None:
+            gate.fence("AGENT_STALLED", "output_limit")
+            gate.check()
         _tv = recover_from_truncation(
             agent, response, finish_reason, _retry, messages=messages,
             conversation_history=conversation_history, api_kwargs=api_kwargs,

@@ -654,6 +654,31 @@ class SessionMessagesMixin:
                 rows.reverse()
         return [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
 
+    def get_inference_terminal_marker(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Durable terminal fence, including compacted/rewound rows; recovery cannot erase it."""
+        row = self._read_one(
+            "SELECT display_metadata FROM messages WHERE session_id = ? "
+            "AND finish_reason = ? ORDER BY id DESC LIMIT 1",
+            (session_id, "inference_terminal"))
+        if row is None:
+            return None
+        metadata = self._decode_display_metadata(row[0]) or {}
+        marker = metadata.get("inference_terminal")
+        if isinstance(marker, dict) and marker.get("code") and marker.get("reason"):
+            return marker
+        # The marker row itself is sufficient evidence to stop. A malformed
+        # receipt must not silently enable session recovery or another provider.
+        return {"code": "AGENT_STALLED", "reason": "terminal_receipt_unreadable",
+                "status": "BLOCKED", "cancel_result": "CANCEL_UNKNOWN", "zero_resend": True}
+
+    def update_inference_terminal_marker(self, session_id: str, terminal: Dict[str, Any]) -> None:
+        """Update only the matching terminal receipt; preserve the transcript and its fence."""
+        self._write_sql(
+            "UPDATE messages SET display_metadata = ? WHERE session_id = ? "
+            "AND finish_reason = 'inference_terminal' "
+            "AND json_extract(display_metadata, '$.inference_terminal.turn_id') = ?",
+            (self._encode_display_metadata({"inference_terminal": terminal}), session_id, terminal["turn_id"]))
+
     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
         """Tool results containing ``/pull/``: a deliberately loose scan, oldest-first so the caller takes the last."""
         ids = [s for s in session_ids if s]

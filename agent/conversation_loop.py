@@ -1360,7 +1360,12 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
 
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
+    from agent.inference_gate import InferenceBlocked, blocked_turn_result
     while s.retry_count < s.max_retries:
+        from agent.inference_gate import get_gate
+        gate = get_gate(agent)
+        if gate is not None and gate.terminal:
+            return blocked_turn_result(agent, s)
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result
@@ -1375,10 +1380,15 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
                 return _rc.result
             if _rc.action == "break":
                 return None
+        except InferenceBlocked:
+            return blocked_turn_result(agent, s)
         except InterruptedError:
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
                 return None
         except Exception as api_error:
+            if gate is not None:
+                gate.fence("AGENT_STALLED", "api_error_no_retry")
+                return blocked_turn_result(agent, s)
             _ae = _run_phase(handle_api_error, agent, s, api_error=api_error)
             if _ae.action == "return":
                 return _ae.result
@@ -1467,6 +1477,10 @@ def run_conversation(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
+    from agent.inference_gate import InferenceBlocked, get_gate, blocked_turn_result
+    gate = get_gate(agent)
+    if gate is not None:
+        gate.messages, gate.history = s.messages, s.conversation_history
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
     if agent.api_mode == "codex_app_server":
@@ -1477,6 +1491,8 @@ def run_conversation(
         )
 
     while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        if gate is not None and gate.terminal:
+            return blocked_turn_result(agent, s)
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)
@@ -1519,15 +1535,20 @@ def run_conversation(
                 break
             if _v.action == "continue":
                 continue
+        except InferenceBlocked:
+            return blocked_turn_result(agent, s)
         except Exception as e:
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
                 break
 
     # Post-loop finalization lives in agent/turn_finalizer.finalize_turn.
-    result = finalize_turn(agent, **{
-        name: getattr(s, name)
-        for name in inspect.signature(finalize_turn).parameters if name != "agent"
-    })
+    try:
+        result = finalize_turn(agent, **{
+            name: getattr(s, name)
+            for name in inspect.signature(finalize_turn).parameters if name != "agent"
+        })
+    except InferenceBlocked:
+        return blocked_turn_result(agent, s)
     if s._compression_timeout_exhausted:
         # Reuse the gateway's context-recovery contract: transcript stays intact while
         # future input can move to a clean session (#98722).

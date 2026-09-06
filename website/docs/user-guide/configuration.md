@@ -1172,6 +1172,52 @@ This budget bounds every non-streaming call. A provider that accepts a request a
 
 Cron jobs and delegated subagents stream too. They run the request inline on their own thread (the interrupt worker other sessions use wedges inside the gateway's nested thread pools), but the wire request is still `stream: true`, so the **stale stream detection** budget above governs them — every token counts as liveness, so a reasoning model that thinks for minutes is not mistaken for a hung provider, and edge proxies that kill silent connections keep seeing bytes.
 
+### Terminal inference gate for LM Studio
+
+The opt-in gate uses the existing streaming worker and request-owned cancellation.
+It applies to the main LM Studio inference path, including CLI, gateway and desktop turns.
+Other providers keep their existing timeout policy.
+
+```yaml
+agent:
+  terminal_inference_gate:
+    enabled: true
+    first_token_seconds: 300  # Calibrate for the representative cold prompt
+    transport_seconds: 120
+    useful_seconds: 300
+    absolute_seconds: 600
+    max_output_tokens: 8192
+    # model: exact-model-identifier  # Optional restriction to one model
+```
+
+Before the first substantive model delta, an independent first-token budget covers
+prefill and first-token waiting. The OpenAI-compatible stream does not reliably report
+prefill completion, so the generation transport clock starts at the first substantive
+delta. The socket read timeout permits this first-token budget; the existing monitor
+still enforces the shorter generation-stall deadline after generation starts.
+First-token waiting does not postpone the useful-progress or absolute deadline.
+
+Transport progress means a content, reasoning or tool-argument delta. Pings, empty
+frames, role changes and metadata do not count. Useful progress means visible answer
+text or a completed, schema-valid tool call; reasoning and partial arguments do not
+extend this clock. Every inference has an absolute ceiling, including prefill.
+The inference clocks stop while an already-dispatched tool owns execution.
+
+A deadline publishes a durable `BLOCKED` fence before cancelling the request once.
+The turn cannot retry, reconnect, fall back, continue a partial response, or execute
+late/partial tool calls. Output truncation (`finish_reason=length`), invalid or empty
+completions and exhausted iteration budgets also block instead of continuing.
+The gate requires the existing session database; the transcript marker survives
+agent reconstruction and prevents another provider from resuming that session.
+
+Cancellation waits at most ten seconds for the request owner and matching stream
+to end and for the local LM Studio CLI to report idle with no queued predictions.
+Otherwise the receipt remains `CANCEL_UNKNOWN`. Either outcome stays `BLOCKED`;
+an operator must reconcile the outcome before starting new work. The gate never
+restarts LM Studio, changes its model settings, or closes a shared provider client.
+When enabled, it requires streaming and keeps the instant session title without
+starting a background title inference. It does not change model context length.
+
 ### Disabling API streaming
 
 `model.streaming: false` forces non-streaming requests for the whole session — parent and subagents alike. It is an escape hatch for self-hosted OpenAI-compatible servers whose *streaming* tool-call path is broken (for example vLLM with `--tool-call-parser qwen3_xml` plus a reasoning parser can leak tool-call markup into plain text and return zero `tool_calls`, so delegated tasks silently no-op). Default is `true`; leave it unless you hit that class of bug, since non-streaming calls lose the liveness properties described above. This is separate from `display.streaming`, which only controls token rendering in the terminal.

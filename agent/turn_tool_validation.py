@@ -77,6 +77,12 @@ def validate_tool_calls(
     outright rather than retried."""
     from agent.conversation_loop import _invalid_tool_name_error_content
 
+    from agent.inference_gate import require_unfenced, validate_response
+    gate = require_unfenced(agent)
+    if gate is not None:
+        from types import SimpleNamespace
+        validate_response(gate, SimpleNamespace(choices=[SimpleNamespace(
+            message=assistant_message, finish_reason=finish_reason)]), agent.tools)
     tool_calls = assistant_message.tool_calls
     valid_names = agent.valid_tool_names
 

@@ -1667,6 +1667,8 @@ class TurnRunner:
         # compression_exhausted so the gateway never auto-resets a session a concurrent compressor is
         # about to shrink.
         common = {
+            "blocked": result.get("blocked", False), "status": result.get("status"),
+            "retryable": result.get("retryable"), "inference_gate": result.get("inference_gate"),
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
