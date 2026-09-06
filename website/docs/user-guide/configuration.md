@@ -1182,12 +1182,20 @@ Other providers keep their existing timeout policy.
 agent:
   terminal_inference_gate:
     enabled: true
+    first_token_seconds: 300  # Calibrate for the representative cold prompt
     transport_seconds: 120
     useful_seconds: 300
     absolute_seconds: 600
     max_output_tokens: 8192
     # model: exact-model-identifier  # Optional restriction to one model
 ```
+
+Before the first substantive model delta, an independent first-token budget covers
+prefill and first-token waiting. The OpenAI-compatible stream does not reliably report
+prefill completion, so the generation transport clock starts at the first substantive
+delta. The socket read timeout permits this first-token budget; the existing monitor
+still enforces the shorter generation-stall deadline after generation starts.
+First-token waiting does not postpone the useful-progress or absolute deadline.
 
 Transport progress means a content, reasoning or tool-argument delta. Pings, empty
 frames, role changes and metadata do not count. Useful progress means visible answer

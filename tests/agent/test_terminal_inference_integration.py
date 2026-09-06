@@ -20,7 +20,7 @@ def runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(TurnInferenceGate, "__init__", lambda self, agent, limits, **kw:
                         original(self, agent, limits, clock=clock))
     monkeypatch.setattr(config, "load_config_readonly", lambda: {
-        "agent": {"terminal_inference_gate": {"enabled": True}},
+        "agent": {"terminal_inference_gate": {"enabled": True, "first_token_seconds": 120}},
         "model": {"context_length": 71936}})
     monkeypatch.setattr(AIAgent, "_ensure_lmstudio_runtime_loaded", lambda *a: 71936)
     monkeypatch.setattr(stream_gate, "local_lane_idle", lambda *a: True)
@@ -114,6 +114,33 @@ def test_normal_turn_and_second_normal_turn_complete(runtime, platform):
     assert all(c.kwargs["max_tokens"] == 8192 for c in client.chat.completions.create.call_args_list)
     if platform != "cli":
         assert owners == [threading.get_ident()] * 2  # preserve the native no-nested-worker contract
+
+
+def test_full_turn_cold_first_token_then_warm_turn_use_separate_clocks(runtime, monkeypatch):
+    import hermes_cli.config as config
+    agent, client, clock, _, abort = runtime
+    monkeypatch.setattr(config, "load_config_readonly", lambda: {
+        "agent": {"terminal_inference_gate": {"enabled": True, "first_token_seconds": 240}},
+        "model": {"context_length": 71936}})
+    def frames():
+        for second in (0, 120, 190):
+            clock.now = second
+            frame = chunk()
+            frame.choices[0].delta.role = "assistant"
+            yield frame
+        clock.now = 200
+        yield chunk(reasoning_content="brief")
+        clock.now = 201
+        yield chunk(content="OK")
+        yield chunk(finish_reason="stop")
+    client.chat.completions.create.side_effect = [Stream(frames), Stream(lambda: iter([
+        chunk(content="OK"), chunk(finish_reason="stop")]))]
+    for _ in range(2):
+        result = agent.run_conversation("Reply exactly OK", system_message="Answer briefly.")
+        assert result["completed"] and result["final_response"] == "OK"
+    assert client.chat.completions.create.call_count == 2
+    assert all(c.kwargs["timeout"].read == 240 for c in client.chat.completions.create.call_args_list)
+    abort.assert_not_called()
 
 
 def test_late_finish_frame_rejected_after_terminal_fence(runtime):

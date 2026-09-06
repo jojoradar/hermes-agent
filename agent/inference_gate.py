@@ -27,12 +27,14 @@ class Limits:
     useful: float = 300.0
     absolute: float = 600.0
     output: int = 8192
+    first_token: float = 300.0
 
 
 class InferenceClock:
     def __init__(self, limits: Limits, clock=time.monotonic):
         self.limits, self.clock = limits, clock
         self.started = self.transport = self.useful = clock()
+        self.first_delta_at = None
         self.ended = False
         self.sent = False
         self.cancel_count = 0
@@ -46,7 +48,9 @@ class InferenceClock:
         now = self.clock()
         if now - self.started >= self.limits.absolute:
             return "AGENT_STALLED", "absolute_limit"
-        if now - self.transport >= self.limits.transport:
+        if self.first_delta_at is None and now - self.started >= self.limits.first_token:
+            return "INFERENCE_STALLED", "first_token_timeout"
+        if self.first_delta_at is not None and now - self.transport >= self.limits.transport:
             return "INFERENCE_STALLED", "transport_stall"
         if now - self.useful >= self.limits.useful:
             return "AGENT_STALLED", "useful_progress"
@@ -63,6 +67,8 @@ class InferenceClock:
             self.tools_pending |= bool(getattr(delta, "tool_calls", None))
             if content or reasoning or arguments:
                 self.transport = self.clock()
+                if self.first_delta_at is None:
+                    self.first_delta_at = self.transport
             # Split inline <think> tags must not turn reasoning into answer progress.
             if isinstance(content, str) and self.scrubber.feed(content).strip() and not self.tools_pending:
                 self.useful = self.clock()
@@ -172,9 +178,10 @@ def admit_turn(agent, history=None):
         agent._terminal_inference_gate = None
         return None
     limits = Limits(float(cfg.get("transport_seconds", 120)), float(cfg.get("useful_seconds", 300)),
-                    float(cfg.get("absolute_seconds", 600)), int(cfg.get("max_output_tokens", 8192)))
+                    float(cfg.get("absolute_seconds", 600)), int(cfg.get("max_output_tokens", 8192)),
+                    float(cfg.get("first_token_seconds", 300)))
     if any(not math.isfinite(v) or v <= 0 for v in
-           (limits.transport, limits.useful, limits.absolute, limits.output)):
+           (limits.transport, limits.useful, limits.absolute, limits.output, limits.first_token)):
         raise ValueError("Terminal inference limits must be finite and positive")
     gate = agent._terminal_inference_gate = TurnInferenceGate(agent, limits)
     if db is None or not sid:

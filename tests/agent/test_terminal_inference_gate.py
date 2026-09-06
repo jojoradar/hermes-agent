@@ -19,7 +19,7 @@ def chunk(**delta):
     return NS(choices=[NS(delta=NS(**delta), finish_reason=None)])
 
 
-def make_call(limits=Limits()):
+def make_call(limits=Limits(first_token=120)):
     clock = Clock()
     agent = NS(_emit_status=Mock(), _strip_think_blocks=lambda t: t,
                _flush_messages_to_session_db=Mock(return_value=True))
@@ -83,6 +83,65 @@ def test_transport_content_updates_and_absolute_survives_reasoning():
     assert request.transport == request.useful == 719
 
 
+@pytest.mark.parametrize("first_token", [180, 240, 300])
+def test_cold_prefill_does_not_consume_generation_stall_budget(first_token):
+    call, clock = make_call(Limits(first_token=first_token))
+    before_send(call, {})
+    for second in range(1, first_token):
+        clock.now = second
+        call.inference_clock.observe(chunk(role="assistant"))
+        assert check_clock(call)
+        assert call.inference_clock.first_delta_at is None
+    call.inference_clock.observe(chunk(content="OK"))
+    assert call.inference_clock.first_delta_at == first_token - 1
+    clock.now += 119
+    assert check_clock(call)
+    clock.now += 1
+    assert not check_clock(call)
+    assert call.inference_gate.terminal["reason"] == "transport_stall"
+    call.clients.close_once.assert_called_once()
+
+
+@pytest.mark.parametrize("first_token", [180, 240, 300])
+def test_first_token_timeout_keeps_terminal_cancel_and_zero_resend(first_token):
+    call, clock = make_call(Limits(first_token=first_token))
+    before_send(call, {})
+    clock.now = first_token
+    call.inference_clock.observe(chunk(role="assistant"))
+    assert not check_clock(call)
+    assert call.inference_gate.terminal["reason"] == "first_token_timeout"
+    with pytest.raises(InferenceBlocked):
+        before_send(call, {})
+    assert call.inference_clock.cancel_count == 1
+    call.clients.close_once.assert_called_once()
+
+
+def test_first_reasoning_delta_does_not_restart_useful_progress_clock():
+    call, clock = make_call(Limits(first_token=240))
+    before_send(call, {})
+    for second in range(200, 300):
+        clock.now = second
+        call.inference_clock.observe(chunk(reasoning_content="r"))
+        assert check_clock(call)
+    clock.now = 300
+    assert not check_clock(call)
+    assert call.inference_gate.terminal["reason"] == "useful_progress"
+    assert call.inference_clock.first_delta_at == 200
+    assert call.inference_clock.useful == 0
+
+
+def test_socket_read_permits_prefill_without_widening_generation_monitor():
+    import httpx
+    call, clock = make_call(Limits(first_token=240))
+    kwargs = before_send(call, {"timeout": httpx.Timeout(120)})
+    assert kwargs["timeout"].read == 240
+    clock.now = 200
+    call.inference_clock.observe(chunk(content="OK"))
+    clock.now = 320
+    assert not check_clock(call)
+    assert call.inference_gate.terminal["reason"] == "transport_stall"
+
+
 SCHEMA = [{"type": "function", "function": {"name": "harmless", "parameters": {
     "type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"],
     "additionalProperties": False}}}]
@@ -144,10 +203,11 @@ def test_durable_fence_blocks_new_agent_and_recovery(tmp_path, monkeypatch, prov
     db.close()
 
 
+@pytest.mark.parametrize("field", ["absolute_seconds", "first_token_seconds"])
 @pytest.mark.parametrize("ceiling", [float("inf"), float("nan"), 0, -1])
-def test_absolute_ceiling_cannot_be_disabled(monkeypatch, ceiling):
+def test_ceiling_cannot_be_disabled(monkeypatch, ceiling, field):
     import hermes_cli.config as config
     monkeypatch.setattr(config, "load_config_readonly", lambda: {"agent": {
-        "terminal_inference_gate": {"enabled": True, "absolute_seconds": ceiling}}})
+        "terminal_inference_gate": {"enabled": True, field: ceiling}}})
     with pytest.raises(ValueError):
         admit_turn(NS(provider="lmstudio", model="model"))

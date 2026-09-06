@@ -61,8 +61,13 @@ def before_send(call, kwargs):
     old_timeout = result.get("timeout")
     old_timeout = old_timeout if isinstance(old_timeout, httpx.Timeout) else httpx.Timeout(old_timeout)
     bound = gate.limits.transport
-    result["timeout"] = httpx.Timeout(**{name: min(getattr(old_timeout, name) or bound, bound)
-                                        for name in ("connect", "read", "write", "pool")})
+    timeouts = {name: min(getattr(old_timeout, name) or bound, bound)
+                for name in ("connect", "write", "pool")}
+    # The socket must permit cold prefill. After the first substantive delta,
+    # the existing independent monitor still aborts a 120s generation stall.
+    # A role-only frame cannot move either deadline.
+    timeouts["read"] = min(max(gate.limits.first_token, bound), gate.limits.absolute)
+    result["timeout"] = httpx.Timeout(**timeouts)
     key = "max_completion_tokens" if "max_completion_tokens" in result else "max_tokens"
     result[key] = min(int(result.get(key) or gate.limits.output), gate.limits.output)
     return result
