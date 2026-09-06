@@ -873,6 +873,9 @@ def direct_api_call(agent, api_kwargs: dict):
     aborts in-flight sockets via the registered hook, and a per-call ``timeout``
     equal to the stale budget is the backstop when the abort finds nothing (#85252).
     Both surface a retryable ``TimeoutError`` for the outer retry loop."""
+    from agent.inference_gate import require_unfenced
+    if require_unfenced(agent) is not None:
+        return interruptible_streaming_api_call(agent, api_kwargs)
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
     # Resolve the budget BEFORE the heartbeat starts: the resolver may raise
@@ -1300,6 +1303,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     per-request client (interrupts close only that one); a stale-call detector
     kills the connection and raises so the main retry loop can back off / rotate
     credentials / fall back."""
+    from agent.inference_gate import require_unfenced
+    if require_unfenced(agent) is not None:
+        return interruptible_streaming_api_call(agent, api_kwargs)
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
@@ -2021,6 +2027,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    from agent.inference_gate import require_unfenced
+    require_unfenced(agent)
     _arm_rate_limit_cooldown(agent, reason)
     if agent._fallback_index >= len(agent._fallback_chain):
         return _fallback_chain_exhausted(agent, reason)
@@ -2284,6 +2292,12 @@ _SUMMARY_ATTEMPT_BUILDERS = {"codex_responses": _codex_summary_attempt, "anthrop
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    from agent.inference_gate import require_unfenced
+    gate = require_unfenced(agent)
+    if gate is not None:
+        gate.fence("AGENT_STALLED", "iteration_budget_exhausted")
+        gate.terminal["cancel_result"] = "REQUEST_ALREADY_ENDED"
+        gate.check()  # never start an unowned summary/retry after the loop budget
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (-Q, oneshot): keep diagnostics off stdout. quiet_mode is
@@ -2710,6 +2724,8 @@ class _StreamingCall:
         self.managed_stream_holder = {"stream": None}
         # Per-attempt: single-writer token, request-local client, raw HTTP response (chat wire).
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
+        from agent.inference_gate_stream import initialize
+        initialize(self)
 
     # ── shared small helpers ────────────────────────────────────────────
 
@@ -2728,6 +2744,7 @@ class _StreamingCall:
         if callable(close):
             try:
                 close()
+                self.inference_stream_ended = True
             except Exception:
                 logger.debug("Managed provider stream cleanup failed", exc_info=True)
 
@@ -2773,20 +2790,28 @@ class _StreamingCall:
         )
 
     def _fire_first_delta(self):
+        if self.inference_gate and self.inference_gate.terminal:
+            return
         if not self.first_delta_fired["done"] and self.on_first_delta:
             self.first_delta_fired["done"] = True
             self._quiet(self.on_first_delta)
 
     def _emit_text(self, text: str) -> None:
+        if self.inference_gate and self.inference_gate.terminal:
+            return
         self._fire_first_delta()
         self.agent._fire_stream_delta(text)
         self.deltas_were_sent["yes"] = True
 
     def _emit_reasoning(self, text: str) -> None:
+        if self.inference_gate and self.inference_gate.terminal:
+            return
         self._fire_first_delta()
         self.agent._fire_reasoning_delta(text)
 
     def _emit_tool_started(self, name: str) -> None:
+        if self.inference_gate and self.inference_gate.terminal:
+            return
         self._fire_first_delta()
         self.agent._fire_tool_gen_started(name)
 
@@ -2795,6 +2820,8 @@ class _StreamingCall:
         reasoning tags inside it must still reach the display: route through
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
+        if self.inference_gate and self.inference_gate.terminal:
+            return
         if self.agent.stream_delta_callback:
             self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
 
@@ -2871,7 +2898,8 @@ class _StreamingCall:
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
-        return request_client.chat.completions.create(**stream_kwargs)
+        from agent.inference_gate_stream import before_send
+        return request_client.chat.completions.create(**before_send(self, stream_kwargs))
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
@@ -2882,6 +2910,10 @@ class _StreamingCall:
         self._writer_token = claim_stream_writer(self.agent)
 
     def _accept_chat_chunk(self, stream_attempt_id: int, chunk: Any) -> bool:
+        from agent.inference_gate_stream import check_clock, observe
+        if not check_clock(self):
+            return False
+        observe(self, chunk)
         with contextlib.suppress(Exception):
             choices = getattr(chunk, "choices", None)
             choice = choices[0] if choices else None
@@ -2952,6 +2984,8 @@ class _StreamingCall:
             self.clients.set_stream_handle(stream)
 
         for chunk in _iter_provider_stream_chunks(stream, response=lambda: self._attempt_stream_response):
+            if self.inference_gate and self.inference_gate.terminal:
+                break
             self._count_chunk(_diag, chunk)
             if self.agent._interrupt_requested:
                 # A half-read SSE response stays checked out of the httpx pool and the finally
@@ -3251,6 +3285,9 @@ class _StreamingCall:
         ``result["error"]`` set (unless our own interrupt force-closed the
         socket). Runs inside the ``except`` so ``logger.exception`` works."""
         import httpx as _httpx
+        from agent.inference_gate_stream import on_error
+        if on_error(self, e):
+            return False
         # Our own interrupt force-close: no retry/fallback/"reconnecting" (the
         # poll loop raises InterruptedError).
         if self._request_cancelled["value"]:
@@ -3435,6 +3472,11 @@ class _StreamingCall:
         _is_local_base = bool(self.agent.base_url) and is_local_endpoint(self.agent.base_url)
         while not self._call_done.is_set():
             self._call_done.wait(timeout=0.3)
+            if self._call_done.is_set():
+                break
+            from agent.inference_gate_stream import monitor
+            if monitor(self):
+                return
             _hb_now = time.time()
             if _is_local_base and self._poll_local_load_notice(_hb_now):
                 continue
@@ -3442,7 +3484,7 @@ class _StreamingCall:
                 self._mon.last_heartbeat = _hb_now
                 self._heartbeat(int(_hb_now - self.last_chunk_time["t"]), _HEARTBEAT_INTERVAL)
             _stale_elapsed = time.time() - self.last_chunk_time["t"]
-            if _stale_elapsed > self._stream_stale_timeout:
+            if self.inference_gate is None and _stale_elapsed > self._stream_stale_timeout:
                 self._kill_stale_stream(_stale_elapsed)
             if self.agent._interrupt_requested:
                 self._abort_for_interrupt(_stale_elapsed)
@@ -3533,6 +3575,8 @@ class _StreamingCall:
             self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
             self.worker.start()
             self._monitor_loop()
+        from agent.inference_gate_stream import finish
+        finish(self)
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
@@ -3554,6 +3598,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
     streaming codex runner; cron turns and delegated children run inline."""
+    from agent.inference_gate import require_unfenced
+    require_unfenced(agent)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
     if agent.api_mode == "codex_responses":

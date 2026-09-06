@@ -169,6 +169,13 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
                 return
         # Snapshot runtime identity so the background titler can skip if the user
         # switches models before it fires.
+        from agent.inference_gate import get_gate
+        if get_gate(agent) is not None:
+            # The guarded operational lane must not launch an unowned secondary
+            # prediction. Keep the existing instant title without its background LLM.
+            from agent.title_generator import apply_instant_title
+            apply_instant_title(session_db, session_id, user_text, getattr(agent, "_on_session_title", None))
+            return
         main_runtime = {
             k: getattr(agent, k, None) for k in ("model", "provider", "base_url", "api_key", "api_mode")
         }

@@ -274,6 +274,8 @@ class GatewayGoalsMixin:
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
+        if isinstance(agent_result, dict) and agent_result.get("blocked") is True:
+            return
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         try:
             session_entry = await self.async_session_store.get_or_create_session(
@@ -284,6 +286,11 @@ class GatewayGoalsMixin:
             return
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
+        db = self.session_store._db
+        if db is not None:
+            terminal = db.get_inference_terminal_marker(session_entry.session_id)
+            if isinstance(terminal, dict):
+                return  # streamed delivery can return None; durable fence still wins
         hooks = [("loop completion", self._post_turn_loop_completion)]
         if final_text.strip():
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))

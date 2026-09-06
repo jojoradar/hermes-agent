@@ -360,6 +360,8 @@ class ClientLifecycleMixin:
             logger.debug("%s client abort failed (%s, shared=False) %s error=%s", label, reason, context, exc)
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+        from agent.inference_gate import require_unfenced
+        require_unfenced(self)
         from unittest.mock import Mock
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa" or isinstance(primary_client, Mock):

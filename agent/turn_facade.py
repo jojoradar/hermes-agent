@@ -28,6 +28,14 @@ class TurnFacadeMixin:
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        from agent.inference_gate import admit_turn
+        blocked = admit_turn(self, conversation_history)
+        if blocked is not None:
+            return blocked
+        from agent.inference_gate import get_gate
+        inference_gate = get_gate(self)
+        if inference_gate is not None:
+            inference_gate.turn_active = True
         # A review shares this session_id for cache parity: fence review startup or interrupt
         # an admitted request and await its exit before opening live-turn instrumentation.
         # Foreground priority is retained if the review does not acknowledge within the bounded deadline
@@ -187,6 +195,8 @@ class TurnFacadeMixin:
                     # Balance note_turn_started so the idle queue's live-turn count cannot leak.
                     with suppress(Exception):
                         _review_queue.note_turn_finished()
+                    if inference_gate is not None:
+                        inference_gate.turn_active = False
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """Final response string of one turn; ``stream_callback`` receives each text delta."""
