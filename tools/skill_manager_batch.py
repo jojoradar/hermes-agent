@@ -143,7 +143,9 @@ def _snapshot_skills(names, snap_root, find_skill, create_targets):
     snapshots = {}  # skill name -> (pre_dir or None, snapshot_dir or None, dir_pre_existed)
     for nm in dict.fromkeys(names):  # ordered unique
         pre = find_skill(nm)
-        pre_dir = Path(pre["path"]) if pre else None
+        # Roll back the mounted package's contents, never replace its symlink
+        # with a local copy while leaving the shared target partially edited.
+        pre_dir = Path(pre["path"]).resolve() if pre else None
         snap = snap_root / nm if pre_dir is not None and pre_dir.is_dir() else None
         if snap is not None:
             try:
@@ -205,7 +207,7 @@ def _rollback(snapshots, find_skill, results):
                    if r["name"] == nm and r["action"] == "write_file" and r["file_path"]]
         try:
             post = find_skill(nm)
-            _restore_snapshot(pre_dir, snap, Path(post["path"]) if post else None,
+            _restore_snapshot(pre_dir, snap, Path(post["path"]).resolve() if post else None,
                               dir_pre_existed, written)
         except Exception as exc:
             notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})"
